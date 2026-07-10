@@ -169,11 +169,48 @@ async def run_semantic() -> dict | None:
     return {"rows": rows}
 
 
+# A realistic assistant system prompt — the rotor's injection is appended
+# to something like this in a real Claude Desktop / Claude Code request,
+# not to an empty string. We inject exactly as production does (via the
+# real rotor.inject) so the A/B tests the actual format.
+_BASE_SYSTEM = (
+    "You are a helpful AI assistant. Be concise and direct. Answer in one "
+    "sentence. If you genuinely do not have the information, say so plainly "
+    "rather than guessing."
+)
+_REFUSAL = ("i don't know", "i do not know", "don't have", "do not have",
+            "no information", "not sure", "cannot", "can't", "unable",
+            "i'm not aware", "i am not aware", "no record", "as an ai")
+
+
+async def _chat(system: str, user: str) -> str:
+    """One proper system+user chat turn against the local model."""
+    import httpx
+
+    from ada.encoder.local_enricher import local_base_url, local_model_name
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as http:
+            r = await http.post(f"{local_base_url()}/chat/completions", json={
+                "model": local_model_name(),
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}],
+                "max_tokens": 80, "temperature": 0.0})
+            if r.status_code != 200:
+                return ""
+            txt = (r.json()["choices"][0]["message"]["content"] or "").strip()
+            if "</think>" in txt:
+                txt = txt.rsplit("</think>", 1)[-1].strip()
+            return txt
+    except Exception:
+        return ""
+
+
 async def run_e2e() -> dict | None:
-    """END-TO-END A/B against the local model — baseline (no memory) vs
-    treated (rotor injection). None when no model answers."""
+    """END-TO-END A/B against the local model — the SAME realistic prompt
+    answered baseline (no memory) vs treated (real rotor injection). None
+    when no model answers. Scores correctness AND the meaningful flip:
+    a baseline that can't answer (refuses / guesses) → a specific answer."""
     from ada.encoder.local_enricher import local_available
-    from ada.rotor import llm as llm_mod
     from ada.rotor import rotor as rotor_mod
 
     if not local_available():
@@ -181,31 +218,31 @@ async def run_e2e() -> dict | None:
     store, sf = await _build_store()
     brain = _Brain(store)
 
-    async def ask(question: str, memory: str) -> str:
-        sys = ("Answer in one short sentence using only what you are told. "
-               "If you do not know, say 'I don't know'.")
-        if memory:
-            sys += "\n\n<memory>\n" + memory + "\n</memory>"
-        out = await llm_mod.complete(
-            f"System: {sys}\n\nUser: {question}\nAssistant:", max_tokens=60)
-        return (out or "").lower()
-
-    results = []
+    results, samples = [], []
     for p in PROBES:
         if p["kind"] == "distractor":
             continue
         rotor_mod._CONV_CACHE.clear()
         injection = await rotor_mod.spin(
             brain, sf, {"messages": [{"role": "user", "content": p["q"]}]}) or ""
-        base = await ask(p["q"], "")
-        treat = await ask(p["q"], injection)
-        results.append({
+        # treated system = the caller's prompt + the REAL injected block
+        treated_sys = rotor_mod.inject({"system": _BASE_SYSTEM},
+                                       injection)["system"] if injection else _BASE_SYSTEM
+        base = await _chat(_BASE_SYSTEM, p["q"])
+        treat = await _chat(treated_sys, p["q"])
+        bl, tl = base.lower(), treat.lower()
+        row = {
             "q": p["q"], "kind": p["kind"],
-            "base_ok": all(n.lower() in base for n in p["needs"]),
-            "treat_ok": all(n.lower() in treat for n in p["needs"]),
+            "base_ok": bool(p["needs"]) and all(n.lower() in bl for n in p["needs"]),
+            "treat_ok": bool(p["needs"]) and all(n.lower() in tl for n in p["needs"]),
+            "base_refused": any(m in bl for m in _REFUSAL),
+            "changed": base.strip() != treat.strip(),
             "tokens": _est_tokens(injection),
-        })
-    return {"results": results}
+        }
+        results.append(row)
+        if len(samples) < 3 and row["treat_ok"] and not row["base_ok"]:
+            samples.append({"q": p["q"], "base": base, "treat": treat})
+    return {"results": results, "samples": samples}
 
 
 def _pct(n, d):
@@ -245,21 +282,31 @@ def report(retr: dict, sem: dict | None, e2e: dict | None) -> str:
         out.append(f"  recall@semantic (paraphrase): {_pct(s, len(sem['rows']))} "
                    f"({s}/{len(sem['rows'])})  — lattice-only got 0%")
 
-    out += ["", "END-TO-END A/B (local model: baseline vs rotor injection)"]
+    out += ["", "END-TO-END A/B (does the injection change the model's ANSWER)"]
     if e2e is None:
         out.append("  skipped — no local model at ADA_LOCAL_URL "
                    "(set one up + ADA_E2E=1 to run)")
     else:
         res = e2e["results"]
+        n = len(res)
         b = sum(r["base_ok"] for r in res)
         t = sum(r["treat_ok"] for r in res)
         wins = sum(1 for r in res if r["treat_ok"] and not r["base_ok"])
-        toks = sum(r["tokens"] for r in res) / max(len(res), 1)
-        out.append(f"  baseline (no memory): {_pct(b, len(res))} ({b}/{len(res)})")
-        out.append(f"  rotor    (injected) : {_pct(t, len(res))} ({t}/{len(res)})")
-        out.append(f"  answers the rotor unlocked: {wins} "
-                   f"(baseline structurally cannot know these)")
-        out.append(f"  cost of the lift: ~{toks:.0f} input tokens / question")
+        changed = sum(r["changed"] for r in res)
+        refused = sum(r["base_refused"] for r in res)
+        toks = sum(r["tokens"] for r in res) / max(n, 1)
+        out.append(f"  baseline correct (no memory): {_pct(b, n)} ({b}/{n})")
+        out.append(f"  rotor correct    (injected) : {_pct(t, n)} ({t}/{n})")
+        out.append(f"  answers the rotor unlocked  : {wins}/{n} "
+                   f"(baseline wrong/unknown → rotor right)")
+        out.append(f"  responses that changed      : {changed}/{n}")
+        out.append(f"  baseline said 'I don't know': {refused}/{n} "
+                   f"(honest refusals the memory resolves)")
+        out.append(f"  cost of the lift            : ~{toks:.0f} input tokens / question")
+        for s in e2e.get("samples", []):
+            out += ["", f"    Q: {s['q']}",
+                    f"      baseline: {s['base'][:100]}",
+                    f"      + rotor : {s['treat'][:100]}"]
     out.append("")
     return "\n".join(out)
 
