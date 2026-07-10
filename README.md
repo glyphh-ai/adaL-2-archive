@@ -153,6 +153,24 @@ there to persist the substrate.
 
 ---
 
+## The rotor — Ada in front of Claude
+
+Point Claude Desktop (Developer → Configure Third-Party Inference →
+Gateway) or any `ANTHROPIC_BASE_URL` client at `http://localhost:8002`
+and every `/v1/messages` call runs the **rotor** on its way to
+Anthropic: **write** the prompt into short-term memory, **recall**
+through the lattice + a semantic embedding layer to build the prompt's
+fact tree (grouped by semantic primes), **reason** it into one bounded
+`<ada:memory>` block injected just in time. Your API key rides the
+request and is forwarded verbatim — never stored. Responses stream back
+byte-for-byte, and a background cascade folds turns → events → lattice
+facts. Full design: [`docs/ROTOR.md`](docs/ROTOR.md).
+
+```bash
+ollama pull nomic-embed-text     # the semantic layer's embedder
+ada serve                        # rotor online at /v1/messages
+```
+
 ## Using it from an LLM (MCP)
 
 Ada exposes a single MCP endpoint at **`/mcp`**. Start the server, then point
@@ -230,11 +248,16 @@ is read by both the server and the `ada` REPL.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ADA_LOCAL_URL` | `http://127.0.0.1:11434/v1` | OpenAI-compatible local endpoint (Ollama default; llama-server works too) |
-| `ADA_LOCAL_MODEL` | `qwen3:4b` | Local model tag for enrichment / rendering |
+| `ADA_LOCAL_MODEL` | `qwen3:4b` | Local model — install whatever you like, name it here |
 | `DATABASE_URL` | SQLite at `~/.ada/ada.db` | `postgresql://…` switches to the Postgres backend |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | `8002` | Server port |
 | `ADA_STORAGE` | `sql` | `sql` (fact_slots-backed, durable, O(1) boot for 10M+ facts) or `memory` (in-RAM indexes, ephemeral) |
+| `ADA_ROTOR` | `true` | Run the rotor on `/v1/messages` (`false` = pure passthrough) |
+| `ADA_UPSTREAM` | `https://api.anthropic.com` | Where proxied `/v1/*` requests go |
+| `ADA_EMBED_URL` | (`ADA_LOCAL_URL`) | OpenAI-compatible `/embeddings` endpoint |
+| `ADA_EMBED_MODEL` | `nomic-embed-text` | Embedding model for the semantic layer |
+| `ADA_INJECT_BUDGET` | `1500` | Max characters of injected memory |
 | `ENABLE_DOCS` | `false` | Enable `/docs` and `/redoc` |
 
 ---

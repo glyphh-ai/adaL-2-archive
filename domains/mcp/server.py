@@ -449,6 +449,16 @@ def create_mcp_server(brain: Any) -> Server:
                 inputSchema={"type": "object", "properties": {}},
             ),
             Tool(
+                name="rotor_stats",
+                description=(
+                    "Rotor layered-memory vital signs: conversations, "
+                    "short-term turns (and how many are pooled awaiting "
+                    "summarization), mid-term events (and how many await "
+                    "distillation into lattice facts)."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
                 name="config",
                 description=(
                     "Runtime configuration: version, model, resolved "
@@ -582,6 +592,8 @@ def create_mcp_server(brain: Any) -> Server:
             return await _handle_consolidate(brain, args)
         if name == "stats":
             return await _handle_stats(brain, args)
+        if name == "rotor_stats":
+            return await _handle_rotor_stats(brain, args)
         if name == "config":
             return await _handle_config(brain, args)
         if name == "create_token":
@@ -1166,6 +1178,16 @@ async def _handle_stats(brain, args: dict) -> CallToolResult:
         return _ok(await _maybe(store.stats()))
     except Exception as e:
         logger.error("stats failed: %s", e, exc_info=True)
+        return _err(str(e))
+
+
+async def _handle_rotor_stats(brain, args: dict) -> CallToolResult:
+    try:
+        from ada.rotor.memory import stats as rotor_stats
+        from infrastructure.database import async_session_maker
+        return _ok(await rotor_stats(async_session_maker))
+    except Exception as e:
+        logger.error("rotor_stats failed: %s", e, exc_info=True)
         return _err(str(e))
 
 

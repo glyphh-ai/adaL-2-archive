@@ -43,6 +43,31 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("ADA_ENRICHER"),
     )
 
+    # Rotor — the memory proxy in front of Anthropic (see docs/ROTOR.md).
+    rotor_enabled: bool = Field(
+        default=True, description="Run the rotor on /v1/messages",
+        validation_alias=AliasChoices("ADA_ROTOR"),
+    )
+    anthropic_upstream: str = Field(
+        default="https://api.anthropic.com",
+        description="Upstream for proxied /v1/* requests",
+        validation_alias=AliasChoices("ADA_UPSTREAM"),
+    )
+    embed_url: str = Field(
+        default="", description="OpenAI-compatible /embeddings endpoint "
+                                "(empty → ADA_LOCAL_URL)",
+        validation_alias=AliasChoices("ADA_EMBED_URL"),
+    )
+    embed_model: str = Field(
+        default="nomic-embed-text",
+        description="Embedding model (ollama pull nomic-embed-text)",
+        validation_alias=AliasChoices("ADA_EMBED_MODEL"),
+    )
+    inject_budget: int = Field(
+        default=1500, description="Max characters of injected memory",
+        validation_alias=AliasChoices("ADA_INJECT_BUDGET"),
+    )
+
     # Dev flags
     enable_docs: bool = Field(default=False, description="Enable /docs endpoint")
     cors_allow_all: bool = Field(default=True, description="Allow all CORS origins")

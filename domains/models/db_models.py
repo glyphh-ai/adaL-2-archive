@@ -16,6 +16,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    LargeBinary,
     String,
     Text,
 )
@@ -117,4 +118,53 @@ class FactSlot(Base):
         Index("idx_slots_entity", space_id, entity, is_current),
         Index("idx_slots_key", space_id, key, version),
         Index("idx_slots_thought", thought_id),
+    )
+
+
+class RotorTurn(Base):
+    """
+    Short-term memory: one proxied prompt/response turn, stored as a
+    whole (verbatim), in sequence, per conversation. `vec` is the
+    unit-normalized embedding (packed float32) when the embedder was up;
+    NULL degrades that row to lexical-only. `summarized=1` once the
+    cascade has folded the turn into a mid-term event.
+    """
+    __tablename__ = "rotor_turns"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conv_id = Column(String(64), nullable=False, index=True)
+    role = Column(String(16), nullable=False)          # user | assistant
+    content = Column(Text, nullable=False)
+    sha = Column(String(64), nullable=False)           # dedup within conv
+    primes = Column(JSONType, default=list)            # semantic primes
+    vec = Column(LargeBinary, nullable=True)           # packed f32, unit norm
+    created_at = Column(Float, nullable=False)
+    summarized = Column(Integer, default=0, nullable=False)
+
+    __table_args__ = (
+        Index("idx_rotor_turn_conv_sha", conv_id, sha, unique=True),
+        Index("idx_rotor_turn_pending", summarized, conv_id),
+    )
+
+
+class RotorEvent(Base):
+    """
+    Mid-term memory: a local-model summary of a span of turns — what
+    happened, who was involved. Carries its own embedding + primes.
+    `distilled=1` once long-term facts have been extracted into the
+    lattice.
+    """
+    __tablename__ = "rotor_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conv_id = Column(String(64), nullable=False, index=True)
+    summary = Column(Text, nullable=False)
+    primes = Column(JSONType, default=list)
+    vec = Column(LargeBinary, nullable=True)
+    turn_ids = Column(JSONType, default=list)
+    created_at = Column(Float, nullable=False)
+    distilled = Column(Integer, default=0, nullable=False)
+
+    __table_args__ = (
+        Index("idx_rotor_event_pending", distilled),
     )

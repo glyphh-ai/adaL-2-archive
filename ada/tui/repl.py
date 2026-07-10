@@ -129,6 +129,7 @@ _HELP = """[b]memory[/b]
   token                  list tokens
   token revoke|delete <id>   manage a token
   stats                  substrate vital signs
+  rotor                  layered-memory vital signs (turns · events · facts)
   clear                  clear the scrollback
   help                   this help
   exit                   leave the REPL
@@ -242,6 +243,11 @@ def _dispatch(sess: Session, raw: str) -> None:
         if not err(r):
             for k, v in r.items():
                 out(f"[{TEXT_FAINT}]{k:<18}[/] {v}")
+    elif verb == "rotor":
+        r = sess.call("rotor_stats", {})
+        if not err(r):
+            for k, v in r.items():
+                out(f"[{TEXT_FAINT}]{k:<26}[/] {v}")
     elif verb == "tell":
         args = {"text": rest}
         if rest.startswith("key="):

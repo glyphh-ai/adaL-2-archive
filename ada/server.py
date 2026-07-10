@@ -122,6 +122,28 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     persist_task = asyncio.create_task(_persist_worker())
 
+    # ── The rotor cascade: short → mid → long, in the background ────────
+    from ada.rotor.memory import cascade as _rotor_cascade
+
+    async def _cascade_worker():
+        """Fold turns into events, distill events into lattice facts.
+        Skips silently when the local model is down — work waits."""
+        while True:
+            await asyncio.sleep(60.0)
+            try:
+                report = await _rotor_cascade(async_session_maker, brain)
+                if report["events"] or report["facts"]:
+                    logger.info("rotor cascade: %(events)d events, "
+                                "%(facts)d facts", report)
+            except Exception:
+                logger.debug("cascade pass failed", exc_info=True)
+
+    cascade_task = None
+    if settings.rotor_enabled:
+        cascade_task = asyncio.create_task(_cascade_worker())
+        logger.info("Rotor online at /v1/messages → %s",
+                    settings.anthropic_upstream)
+
     logger.info("Ada is awake.")
 
     # Run MCP session managers
@@ -132,6 +154,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── Shutdown ─────────────────────────────────────────────────────────
     logger.info("Going to sleep...")
     persist_task.cancel()
+    if cascade_task:
+        cascade_task.cancel()
     # Final flush — don't lose queued thoughts
     await brain.flush_persist_queue()
 
@@ -234,8 +258,10 @@ def _is_allowed_origin(origin: str) -> bool:
 
 # Import and include routers
 from api.routes import health_router
+from ada.rotor.proxy import router as rotor_router
 
 app.include_router(health_router)
+app.include_router(rotor_router)
 
 
 # ── Root — `ada` (the REPL) is the single interface. `/` is just a
@@ -244,7 +270,7 @@ app.include_router(health_router)
 async def root() -> dict:
     """Drive Ada from the `ada` REPL, or any MCP client over /mcp."""
     return {"service": "ada", "interface": "repl (run `ada`)",
-            "mcp": "/mcp", "health": "/health"}
+            "mcp": "/mcp", "rotor": "/v1/messages", "health": "/health"}
 
 
 # MCP routing middleware — intercepts /mcp requests and forwards to the
