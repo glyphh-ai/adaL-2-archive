@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
-      - run: ruff check ada domains api infrastructure shared tests
+      - run: ruff check ada domains api infrastructure shared tests benchmarks
       - run: pytest -q tests/
       - name: import sweep — every module loads
         run: |

@@ -68,6 +68,11 @@ ada = "ada.tui.cli:main"
 [project.urls]
 Repository = "https://github.com/glyphh-ai/adaL"
 
+[tool.pytest.ini_options]
+# Repo root on the path so tests can import the benchmarks/ harness (not
+# shipped in the wheel — it is a dev/eval artifact, not runtime).
+pythonpath = ["."]
+
 [tool.setuptools.packages.find]
 # ada* — SDK + CLI + server entry point (ada/server.py)
 # The remaining packages are the server-side runtime bundled for `ada dev`
