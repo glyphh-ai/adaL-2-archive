@@ -225,6 +225,45 @@ def test_inject_appends_never_replaces():
     assert "<ada:memory>" in rotor_mod.inject({}, "MEM")["system"]
 
 
+# ── concurrency: the enricher must never block the event loop ──────────
+
+def test_recall_runs_enricher_off_the_event_loop(tmp_path):
+    """SqlFactStore.recall sits in the proxied request path; a local-model
+    enricher blocks on HTTP, so it MUST run in a worker thread, not on the
+    loop. Proven deterministically: the enricher records its thread id."""
+    import threading
+
+    from ada.memory.sql_store import SqlFactStore
+
+    seen = {}
+
+    class BlockingEnricher:
+        def enrich(self, text):
+            seen["thread"] = threading.get_ident()
+            return {}
+
+        def universal(self, text):
+            seen["thread"] = threading.get_ident()
+            return {}
+
+    async def run():
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/e.db")
+        sf = async_sessionmaker(engine, expire_on_commit=False)
+        from infrastructure.database.connection import Base
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        store = SqlFactStore(sf, space_id="main", enricher=BlockingEnricher())
+        await store.tell_raw(
+            facts={"entity": {"name": "chris"},
+                   "relational": {"subject": "chris", "predicate": "likes",
+                                  "object": "python"}}, key=None)
+        seen.clear()
+        await store.recall("what does chris like", top_k=3)
+        assert seen.get("thread") is not None
+        assert seen["thread"] != threading.get_ident()   # a worker, not the loop
+    asyncio.run(run())
+
+
 # ── the proxy ──────────────────────────────────────────────────────────
 
 def _proxy_app(tmp_path, monkeypatch, upstream_handler, rotor_ok=True):

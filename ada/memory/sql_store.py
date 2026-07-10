@@ -20,6 +20,7 @@ fully supported in both.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections import defaultdict
@@ -66,16 +67,20 @@ class SqlFactStore:
         meta = (metadata or {}).copy()
         if self._enricher is not None and "_universal" not in meta:
             try:
+                # The enricher may be a local model doing a blocking HTTP
+                # call — keep it off the event loop so a concurrent proxied
+                # stream / MCP call / health check never stalls behind it.
                 universal = getattr(self._enricher, "universal", None)
                 if callable(universal):
-                    mapped = universal(text)
+                    mapped = await asyncio.to_thread(universal, text)
                     if mapped:
                         from ada.memory.thought_space import _resolve_speaker_entity
                         clean = _sanitize_universal(mapped)
                         if speaker_entity:
                             clean = _resolve_speaker_entity(text, clean, speaker_entity)
                         meta["_universal"] = clean
-                meta["_structured"] = self._enricher.enrich(text)
+                meta["_structured"] = await asyncio.to_thread(
+                    self._enricher.enrich, text)
             except Exception:
                 logger.warning("enricher failed for %r", text[:50],
                                exc_info=True)
@@ -523,7 +528,9 @@ class SqlFactStore:
         q_struct = None
         if self._enricher is not None:
             try:
-                q_struct = self._enricher.enrich(query)
+                # Off the event loop: a local-model enricher blocks on HTTP,
+                # and recall sits in the proxied /v1/messages request path.
+                q_struct = await asyncio.to_thread(self._enricher.enrich, query)
             except Exception:
                 q_struct = None
 

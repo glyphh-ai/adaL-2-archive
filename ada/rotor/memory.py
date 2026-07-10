@@ -20,6 +20,7 @@ import logging
 import time
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from ada.rotor import embed as _embed
 from ada.rotor import llm as _llm
@@ -96,13 +97,17 @@ async def write_turn(session_factory, conv_id: str, role: str,
     if not text:
         return None
     sha = hashlib.sha256(text.encode()).hexdigest()
+    # Embed BEFORE opening a session — the embedder is a network call and a
+    # pooled DB connection must never be held across it (pool exhaustion
+    # under concurrency). Claude resends history each turn but write_prompt
+    # only stores the newest turn, so this is almost always a fresh row.
+    vec = await _embed.embed_text(text, kind="document")
     async with session_factory() as s:
         existing = (await s.execute(
             select(RotorTurn.id).where(RotorTurn.conv_id == conv_id,
                                        RotorTurn.sha == sha))).scalar()
         if existing is not None:
             return None
-        vec = await _embed.embed_text(text, kind="document")
         turn = RotorTurn(
             conv_id=conv_id, role=role, content=text, sha=sha,
             primes=decompose(text),
@@ -110,7 +115,11 @@ async def write_turn(session_factory, conv_id: str, role: str,
             created_at=time.time(),
         )
         s.add(turn)
-        await s.commit()
+        try:
+            await s.commit()
+        except IntegrityError:      # concurrent identical write raced us
+            await s.rollback()
+            return None
         await s.refresh(turn)
         return turn.id
 
@@ -197,39 +206,48 @@ async def _summarize_turns(session_factory) -> int:
             select(RotorTurn.conv_id).where(RotorTurn.summarized == 0)
             .group_by(RotorTurn.conv_id))).scalars().all()
     for conv in convs:
+        # 1. Read the span in a short session, then RELEASE the connection —
+        #    the model+embed work below must not hold one (a fold takes up
+        #    to ~90s of network; an idle-in-transaction connection that long
+        #    exhausts the pool / trips server idle timeouts).
         async with session_factory() as s:
             rows = (await s.execute(
-                select(RotorTurn).where(RotorTurn.conv_id == conv,
-                                        RotorTurn.summarized == 0)
-                .order_by(RotorTurn.id).limit(EVENT_TRIGGER))).scalars().all()
-            if len(rows) < EVENT_TRIGGER:
-                continue
-            span = rows[:EVENT_SPAN]
-            transcript = "\n".join(f"{t.role}: {t.content[:400]}" for t in span)
-            summary = await _llm.complete(
-                "Summarize this conversation excerpt as ONE event: what "
-                "happened, who/what was involved, any decisions or facts "
-                "stated. 2-3 plain sentences, past tense, no preamble.\n\n"
-                + transcript, max_tokens=200)
-            if not summary:
-                return made          # model down — the pool waits
-            vec = await _embed.embed_text(summary, kind="document")
-            primes: list[str] = []
-            for t in span:
-                primes.extend(t.primes or [])
+                select(RotorTurn.id, RotorTurn.role, RotorTurn.content,
+                       RotorTurn.primes)
+                .where(RotorTurn.conv_id == conv, RotorTurn.summarized == 0)
+                .order_by(RotorTurn.id).limit(EVENT_TRIGGER))).all()
+        if len(rows) < EVENT_TRIGGER:
+            continue
+        span = rows[:EVENT_SPAN]
+
+        # 2. Model + embed — no DB connection held.
+        transcript = "\n".join(f"{r.role}: {r.content[:400]}" for r in span)
+        summary = await _llm.complete(
+            "Summarize this conversation excerpt as ONE event: what "
+            "happened, who/what was involved, any decisions or facts "
+            "stated. 2-3 plain sentences, past tense, no preamble.\n\n"
+            + transcript, max_tokens=200)
+        if not summary:
+            return made          # model down — the pool waits
+        vec = await _embed.embed_text(summary, kind="document")
+        primes: list[str] = []
+        for r in span:
+            primes.extend(r.primes or [])
+        span_ids = [r.id for r in span]
+
+        # 3. Write the event + mark turns folded — short session.
+        async with session_factory() as s:
             s.add(RotorEvent(
                 conv_id=conv, summary=summary,
                 primes=validate(primes + decompose(summary)),
                 vec=_embed.pack(vec) if vec else None,
-                turn_ids=[t.id for t in span],
-                created_at=time.time(),
+                turn_ids=span_ids, created_at=time.time(),
             ))
-            await s.execute(
-                update(RotorTurn)
-                .where(RotorTurn.id.in_([t.id for t in span]))
-                .values(summarized=1))
+            await s.execute(update(RotorTurn)
+                            .where(RotorTurn.id.in_(span_ids))
+                            .values(summarized=1))
             await s.commit()
-            made += 1
+        made += 1
     return made
 
 
