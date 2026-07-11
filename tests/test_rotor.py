@@ -315,6 +315,11 @@ def _proxy_app(tmp_path, monkeypatch, upstream_handler, rotor_ok=True):
 
 
 def test_proxy_forwards_key_and_injects_memory(tmp_path, monkeypatch, fake_embed):
+    """Fallback path: with NO stored provider key, Ada forwards the
+    caller's own credential (and injects memory). The router path — Ada's
+    stored key — is covered by test_router_attaches_stored_provider_key."""
+    from infrastructure.config import get_settings
+    monkeypatch.setattr(get_settings(), "anthropic_key", "", raising=False)
     seen = {}
 
     def upstream(request: httpx.Request) -> httpx.Response:
@@ -365,11 +370,15 @@ def test_proxy_rotor_failure_is_pure_passthrough(tmp_path, monkeypatch):
 
     from ada.rotor import proxy as proxy_mod
 
-    def broken_factory():
-        raise RuntimeError("db is gone")
-    monkeypatch.setattr(proxy_mod, "_session_factory", broken_factory)
+    # Break the ROTOR (recall/inject) specifically — not the DB, which is
+    # now also the token-gate substrate. A rotor failure must degrade to
+    # pure passthrough; the gate still functions (empty DB → open).
+    async def boom(*a, **k):
+        raise RuntimeError("rotor is down")
+    monkeypatch.setattr(proxy_mod._rotor, "spin", boom)
 
     async def run():
+        sf_holder["sf"] = await _make_db(tmp_path)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport,
                                      base_url="http://ada") as c:
@@ -425,9 +434,10 @@ def test_passthrough_routes_other_v1_paths(tmp_path, monkeypatch):
         assert request.url.path == "/v1/messages/count_tokens"
         return httpx.Response(200, json={"input_tokens": 42})
 
-    app, _ = _proxy_app(tmp_path, monkeypatch, upstream)
+    app, sf_holder = _proxy_app(tmp_path, monkeypatch, upstream)
 
     async def run():
+        sf_holder["sf"] = await _make_db(tmp_path)      # gate substrate (empty → open)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport,
                                      base_url="http://ada") as c:
@@ -575,9 +585,10 @@ def test_malformed_body_passes_through_untouched(tmp_path, monkeypatch):
         seen["raw"] = request.content
         return httpx.Response(400, json={"type": "error"})
 
-    app, _ = _proxy_app(tmp_path, monkeypatch, upstream)
+    app, sf_holder = _proxy_app(tmp_path, monkeypatch, upstream)
 
     async def run():
+        sf_holder["sf"] = await _make_db(tmp_path)      # gate substrate (empty → open)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport,
                                      base_url="http://ada") as c:
@@ -605,4 +616,75 @@ def test_query_params_are_forwarded(tmp_path, monkeypatch, fake_embed):
             await c.post("/v1/messages?beta=true",
                          json={"messages": [{"role": "user", "content": "hi"}]})
         assert seen["q"] == {"beta": "true"}
+    asyncio.run(run())
+
+
+# ── the token gate (Ada's own boundary, distinct from the provider key) ──
+
+def test_token_gate_bootstrap_then_enforced(tmp_path, monkeypatch):
+    """No tokens → open (bootstrap). Once a token exists, a request needs
+    a valid one; the wrong token gets Ada's 401, the right token passes."""
+    import hashlib
+
+    from ada.rotor import auth as auth_mod
+    from domains.models.db_models import Token
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"input_tokens": 1})
+
+    app, sf_holder = _proxy_app(tmp_path, monkeypatch, upstream)
+
+    async def run():
+        sf = await _make_db(tmp_path)
+        sf_holder["sf"] = sf
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://ada") as c:
+            # bootstrap: no tokens yet → open even with a nonsense key
+            r = await c.get("/v1/models", headers={"authorization": "Bearer nope"})
+            assert r.status_code == 200
+
+            # mint one → gate now enforced
+            raw = "ada_realtoken"
+            async with sf() as s:
+                s.add(Token(name="t", token_hash=hashlib.sha256(raw.encode()).hexdigest(),
+                            token_prefix=raw[:12], org_id="ada", permissions=["read"]))
+                await s.commit()
+
+            bad = await c.get("/v1/models", headers={"authorization": "Bearer wrong"})
+            assert bad.status_code == 401
+            assert bad.json()["error"]["type"] == "authentication_error"
+
+            good = await c.get("/v1/models", headers={"authorization": f"Bearer {raw}"})
+            assert good.status_code == 200        # valid token passes the gate
+
+            # x-api-key carries it too
+            xkey = await c.get("/v1/models", headers={"x-api-key": raw})
+            assert xkey.status_code == 200
+        assert await auth_mod.validate_token(raw, sf) is True
+        assert await auth_mod.validate_token("ada_wrong", sf) is False
+    asyncio.run(run())
+
+
+def test_router_attaches_stored_provider_key(tmp_path, monkeypatch):
+    """When Ada holds a provider key, it attaches THAT upstream (as
+    x-api-key for Anthropic) — the caller's Ada token is never forwarded."""
+    from infrastructure.config import get_settings
+
+    seen = {}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        seen["x-api-key"] = request.headers.get("x-api-key")
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"input_tokens": 1})
+
+    app, sf_holder = _proxy_app(tmp_path, monkeypatch, upstream)
+    monkeypatch.setattr(get_settings(), "anthropic_key", "sk-ant-STORED", raising=False)
+
+    async def run():
+        sf_holder["sf"] = await _make_db(tmp_path)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://ada") as c:
+            await c.get("/v1/models", headers={"authorization": "Bearer ada_token"})
+        assert seen["x-api-key"] == "sk-ant-STORED"    # Ada's stored key
+        assert seen["authorization"] is None           # caller's token NOT forwarded
     asyncio.run(run())

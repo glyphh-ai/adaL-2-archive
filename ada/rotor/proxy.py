@@ -39,8 +39,10 @@ router = APIRouter()
 # Request headers that ride through to Anthropic. The caller's credential
 # is forwarded verbatim and NEVER logged or persisted. Duplicates (e.g.
 # multiple anthropic-beta lines) are preserved via the raw header list.
-_FORWARD = {b"x-api-key", b"authorization", b"anthropic-version",
-            b"anthropic-beta", b"content-type", b"accept"}
+# Non-credential headers forwarded verbatim. The credential is NOT
+# forwarded blindly — Ada is a router and attaches its own stored
+# provider key (see _upstream_headers).
+_FORWARD = {b"anthropic-version", b"anthropic-beta", b"content-type", b"accept"}
 # Response headers httpx has already acted on — forwarding them would make
 # the client double-decode or see a wrong length.
 _STRIP_RESP = {"content-encoding", "content-length", "transfer-encoding",
@@ -49,9 +51,39 @@ _SSE_TEXT = re.compile(r'"text_delta","text":"((?:[^"\\]|\\.)*)"')
 _STREAM_DONE = re.compile(rb'"type"\s*:\s*"message_stop"')
 
 
+def _caller_credential(request: Request) -> bytes | None:
+    """The credential the caller presented (x-api-key or Bearer). This is
+    the Ada token — validated by the gate, and used here only as a
+    fallback provider credential when Ada holds no provider key."""
+    xkey = bearer = None
+    for k, v in request.headers.raw:
+        lk = k.lower()
+        if lk == b"x-api-key":
+            xkey = v
+        elif lk == b"authorization" and v[:7].lower() == b"bearer ":
+            bearer = v[7:].strip()
+    return xkey or bearer
+
+
 def _upstream_headers(request: Request) -> list[tuple[bytes, bytes]]:
-    """Raw header list (preserves duplicate header lines)."""
-    return [(k, v) for k, v in request.headers.raw if k.lower() in _FORWARD]
+    """Ada is a router. The caller authenticates to Ada with an Ada token
+    (checked by the gate, not here); this attaches the USER's own stored
+    PROVIDER key for the upstream — Anthropic wants `x-api-key`. If Ada
+    holds no provider key, it falls back to forwarding the caller's own
+    credential (so a user who put their provider key directly in the
+    client still works). Non-credential headers pass through verbatim;
+    no credential is ever logged."""
+    s = get_settings()
+    out = [(k, v) for k, v in request.headers.raw if k.lower() in _FORWARD]
+    to_anthropic = "anthropic.com" in s.anthropic_upstream
+    if to_anthropic and s.anthropic_key:
+        out.append((b"x-api-key", s.anthropic_key.encode()))     # router: Ada's stored key
+        return out
+    cred = _caller_credential(request)                            # fallback: caller's own
+    if cred:
+        out.append((b"x-api-key", cred) if to_anthropic
+                   else (b"authorization", b"Bearer " + cred))
+    return out
 
 
 def _response_headers(resp: httpx.Response) -> list[tuple[str, str]]:
@@ -81,8 +113,35 @@ def _reply_text_from_json(payload: dict) -> str:
                      if isinstance(b, dict) and b.get("type") == "text")
 
 
+async def _gate(request: Request) -> Response | None:
+    """The token gate: the caller's Ada token must be live (or no tokens
+    exist yet — bootstrap). Returns a 401 Response to short-circuit, or
+    None to proceed. Ada's OWN boundary, distinct from the provider key
+    she attaches upstream."""
+    from ada.rotor.auth import gate_ok
+    cred = _caller_credential(request)
+    try:
+        ok = await gate_ok(cred.decode("latin-1") if cred else None,
+                           _session_factory())
+    except Exception:                     # can't verify → fail CLOSED
+        logger.warning("token gate errored — denying", exc_info=True)
+        ok = False
+    if ok:
+        return None
+    return Response(
+        content=json.dumps({"type": "error", "error": {
+            "type": "authentication_error",
+            "message": "Ada: invalid or missing token. Mint one with "
+                       "`ada token create` and set it as the gateway key."}}).encode(),
+        status_code=401, media_type="application/json",
+        headers={"www-authenticate": "Bearer"})
+
+
 @router.post("/v1/messages")
 async def messages(request: Request):
+    denied = await _gate(request)
+    if denied is not None:
+        return denied
     raw_body = await request.body()
     settings = get_settings()
     app = request.app
@@ -175,6 +234,9 @@ async def _stream(client: httpx.AsyncClient, body: dict, out_bytes: bytes,
 async def passthrough(request: Request, path: str):
     """Everything else under /v1 rides through untouched — count_tokens,
     models discovery, whatever Anthropic adds next."""
+    denied = await _gate(request)
+    if denied is not None:
+        return denied
     client = _client()
     try:
         resp = await client.request(

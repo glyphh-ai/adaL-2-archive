@@ -53,6 +53,18 @@ class Settings(BaseSettings):
         description="Upstream for proxied /v1/* requests",
         validation_alias=AliasChoices("ADA_UPSTREAM"),
     )
+    # Provider keyring — Ada is a router: the caller authenticates to Ada
+    # with an Ada key, and Ada attaches the USER's own provider key
+    # (stored here) when forwarding to that provider. Empty → Ada falls
+    # back to forwarding whatever credential the caller sent.
+    anthropic_key: str = Field(
+        default="", description="User's Anthropic key, used upstream",
+        validation_alias=AliasChoices("ADA_ANTHROPIC_KEY", "ANTHROPIC_API_KEY"),
+    )
+    openai_key: str = Field(
+        default="", description="User's OpenAI key (for OpenAI routes)",
+        validation_alias=AliasChoices("ADA_OPENAI_KEY", "OPENAI_API_KEY"),
+    )
     embed_url: str = Field(
         default="", description="OpenAI-compatible /embeddings endpoint "
                                 "(empty → ADA_LOCAL_URL)",

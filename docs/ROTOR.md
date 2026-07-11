@@ -63,12 +63,36 @@ Primes are stored on turns and events at write time; at recall time the
 prompt's own primes select and group what comes back — that grouping
 *is* the fact tree.
 
+## Auth — Ada is a router, so there are two credentials
+
+```
+client ──[ Ada token: ada_… ]──▶ Ada ──[ the user's provider key ]──▶ Anthropic
+        (Gateway API key field)    │                                └▶ OpenAI …
+                                   validates the ada_ token (her Token
+                                   table); attaches the stored provider key
+```
+
+- **client → Ada** authenticates with an **Ada token** (`ada token create`
+  → `ada_…`, stored as a sha256 hash). That's the value you put in the
+  client's "Gateway API key" field — *not* your Anthropic key. The gate is
+  bootstrap-friendly: open until the first token is minted, then required;
+  a bad token gets Ada's own 401, and it fails **closed** if the token
+  store can't be read.
+- **Ada → provider** attaches the **user's own provider key**, which Ada
+  holds (`ADA_ANTHROPIC_KEY` / `ANTHROPIC_API_KEY`, `ADA_OPENAI_KEY` /
+  `OPENAI_API_KEY`). For Anthropic that goes upstream as `x-api-key`
+  (so the client's Bearer-vs-x-api-key choice no longer matters). If Ada
+  holds no provider key, it falls back to forwarding the caller's own
+  credential.
+
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `ADA_UPSTREAM` | `https://api.anthropic.com` | where proxied requests go |
 | `ADA_ROTOR` | `true` | run the rotor on `/v1/messages` (off = pure passthrough) |
+| `ADA_ANTHROPIC_KEY` | (`ANTHROPIC_API_KEY`) | the user's Anthropic key, attached upstream |
+| `ADA_OPENAI_KEY` | (`OPENAI_API_KEY`) | the user's OpenAI key (for OpenAI routes) |
 | `ADA_EMBED_URL` | (`ADA_LOCAL_URL`) | OpenAI-compatible `/embeddings` endpoint |
 | `ADA_EMBED_MODEL` | `nomic-embed-text` | embedding model (`ollama pull nomic-embed-text`) |
 | `ADA_LOCAL_MODEL` | `qwen3:4b` | local model for summarize/distill/decompose — install whatever you like |
